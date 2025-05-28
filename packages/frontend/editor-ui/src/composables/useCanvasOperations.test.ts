@@ -7,7 +7,7 @@ import type {
 	INodeConnections,
 	WorkflowExecuteMode,
 } from 'n8n-workflow';
-import { NodeConnectionType, NodeHelpers } from 'n8n-workflow';
+import { NodeConnectionTypes, NodeHelpers } from 'n8n-workflow';
 import { useCanvasOperations } from '@/composables/useCanvasOperations';
 import type { CanvasConnection, CanvasNode } from '@/types';
 import { CanvasConnectionMode } from '@/types';
@@ -43,14 +43,17 @@ import {
 	FORM_TRIGGER_NODE_TYPE,
 	SET_NODE_TYPE,
 	STICKY_NODE_TYPE,
-	STORES,
 	WEBHOOK_NODE_TYPE,
 } from '@/constants';
+import { STORES } from '@n8n/stores';
 import type { Connection } from '@vue-flow/core';
 import { useClipboard } from '@/composables/useClipboard';
 import { createCanvasConnectionHandleString } from '@/utils/canvasUtils';
 import { nextTick } from 'vue';
 import { useProjectsStore } from '@/stores/projects.store';
+import type { CanvasLayoutEvent } from './useCanvasLayout';
+import { useTelemetry } from './useTelemetry';
+import { useToast } from '@/composables/useToast';
 
 vi.mock('vue-router', async (importOriginal) => {
 	const actual = await importOriginal<{}>();
@@ -79,9 +82,27 @@ vi.mock('@/composables/useClipboard', async () => {
 	return { useClipboard: vi.fn(() => ({ copy: copySpy })) };
 });
 
-vi.mock('@/composables/useTelemetry', () => ({
-	useTelemetry: () => ({ track: vi.fn() }),
-}));
+vi.mock('@/composables/useTelemetry', () => {
+	const track = vi.fn();
+	return {
+		useTelemetry: () => ({ track }),
+	};
+});
+
+vi.mock('@/composables/useToast', () => {
+	const showMessage = vi.fn();
+	const showError = vi.fn();
+	const showToast = vi.fn();
+	return {
+		useToast: () => {
+			return {
+				showMessage,
+				showError,
+				showToast,
+			};
+		},
+	};
+});
 
 describe('useCanvasOperations', () => {
 	const router = useRouter();
@@ -345,11 +366,11 @@ describe('useCanvasOperations', () => {
 			workflowObject.getNode = vi.fn().mockReturnValue(node);
 
 			vi.spyOn(NodeHelpers, 'getNodeOutputs').mockReturnValueOnce([
-				{ type: NodeConnectionType.AiTool },
+				{ type: NodeConnectionTypes.AiTool },
 			]);
 			vi.spyOn(NodeHelpers, 'getConnectionTypes')
-				.mockReturnValueOnce([NodeConnectionType.AiTool])
-				.mockReturnValueOnce([NodeConnectionType.AiTool]);
+				.mockReturnValueOnce([NodeConnectionTypes.AiTool])
+				.mockReturnValueOnce([NodeConnectionTypes.AiTool]);
 
 			const { resolveNodePosition } = useCanvasOperations({ router });
 			const position = resolveNodePosition({ ...node, position: undefined }, nodeTypeDescription);
@@ -443,6 +464,94 @@ describe('useCanvasOperations', () => {
 
 			expect(startRecordingUndoSpy).not.toHaveBeenCalled();
 			expect(stopRecordingUndoSpy).not.toHaveBeenCalled();
+		});
+	});
+
+	describe('tidyUp', () => {
+		it('records history for multiple node position updates', () => {
+			const historyStore = useHistoryStore();
+			const event: CanvasLayoutEvent = {
+				source: 'canvas-button',
+				target: 'all',
+				result: {
+					nodes: [
+						{ id: 'node1', x: 100, y: 100 },
+						{ id: 'node2', x: 200, y: 200 },
+					],
+					boundingBox: { height: 100, width: 100, x: 0, y: 0 },
+				},
+			};
+			const startRecordingUndoSpy = vi.spyOn(historyStore, 'startRecordingUndo');
+			const stopRecordingUndoSpy = vi.spyOn(historyStore, 'stopRecordingUndo');
+
+			const { tidyUp } = useCanvasOperations({ router });
+			tidyUp(event);
+
+			expect(startRecordingUndoSpy).toHaveBeenCalled();
+			expect(stopRecordingUndoSpy).toHaveBeenCalled();
+		});
+
+		it('updates positions for multiple nodes', () => {
+			const workflowsStore = mockedStore(useWorkflowsStore);
+			const event: CanvasLayoutEvent = {
+				source: 'canvas-button',
+				target: 'all',
+				result: {
+					nodes: [
+						{ id: 'node1', x: 100, y: 100 },
+						{ id: 'node2', x: 200, y: 200 },
+					],
+					boundingBox: { height: 100, width: 100, x: 0, y: 0 },
+				},
+			};
+			const setNodePositionByIdSpy = vi.spyOn(workflowsStore, 'setNodePositionById');
+			workflowsStore.getNodeById
+				.mockReturnValueOnce(
+					createTestNode({
+						id: event.result.nodes[0].id,
+						position: [event.result.nodes[0].x, event.result.nodes[0].y],
+					}),
+				)
+				.mockReturnValueOnce(
+					createTestNode({
+						id: event.result.nodes[1].id,
+						position: [event.result.nodes[1].x, event.result.nodes[1].y],
+					}),
+				);
+
+			const { tidyUp } = useCanvasOperations({ router });
+			tidyUp(event);
+
+			expect(setNodePositionByIdSpy).toHaveBeenCalledTimes(2);
+			expect(setNodePositionByIdSpy).toHaveBeenCalledWith('node1', [100, 100]);
+			expect(setNodePositionByIdSpy).toHaveBeenCalledWith('node2', [200, 200]);
+		});
+
+		it('should send a "User tidied up workflow" telemetry event', () => {
+			const event: CanvasLayoutEvent = {
+				source: 'canvas-button',
+				target: 'all',
+				result: {
+					nodes: [
+						{ id: 'node1', x: 100, y: 100 },
+						{ id: 'node2', x: 200, y: 200 },
+					],
+					boundingBox: { height: 100, width: 100, x: 0, y: 0 },
+				},
+			};
+
+			const { tidyUp } = useCanvasOperations({ router });
+			tidyUp(event);
+
+			expect(useTelemetry().track).toHaveBeenCalledWith(
+				'User tidied up canvas',
+				{
+					nodes_count: 2,
+					source: 'canvas-button',
+					target: 'all',
+				},
+				{ withPostHog: true },
+			);
 		});
 	});
 
@@ -782,7 +891,7 @@ describe('useCanvasOperations', () => {
 						[
 							{
 								node: nodes[1].name,
-								type: NodeConnectionType.Main,
+								type: NodeConnectionTypes.Main,
 								index: 0,
 							},
 						],
@@ -793,7 +902,7 @@ describe('useCanvasOperations', () => {
 						[
 							{
 								node: nodes[2].name,
-								type: NodeConnectionType.Main,
+								type: NodeConnectionTypes.Main,
 								index: 0,
 							},
 						],
@@ -856,7 +965,7 @@ describe('useCanvasOperations', () => {
 						[
 							{
 								node: nodes[1].name,
-								type: NodeConnectionType.Main,
+								type: NodeConnectionTypes.Main,
 								index: 0,
 							},
 						],
@@ -869,7 +978,7 @@ describe('useCanvasOperations', () => {
 						[
 							{
 								node: nodes[2].name,
-								type: NodeConnectionType.Main,
+								type: NodeConnectionTypes.Main,
 								index: 0,
 							},
 						],
@@ -1083,8 +1192,8 @@ describe('useCanvasOperations', () => {
 			const nodeTypeName = SET_NODE_TYPE;
 			const nodeType = mockNodeTypeDescription({
 				name: nodeTypeName,
-				inputs: [NodeConnectionType.Main],
-				outputs: [NodeConnectionType.Main],
+				inputs: [NodeConnectionTypes.Main],
+				outputs: [NodeConnectionTypes.Main],
 			});
 			const nodes = [
 				mockNode({ id: 'a', name: 'Node A', type: nodeTypeName, position: [40, 40] }),
@@ -1097,17 +1206,17 @@ describe('useCanvasOperations', () => {
 					sourceHandle: createCanvasConnectionHandleString({
 						mode: CanvasConnectionMode.Output,
 						index: 0,
-						type: NodeConnectionType.Main,
+						type: NodeConnectionTypes.Main,
 					}),
 					target: nodes[1].id,
 					targetHandle: createCanvasConnectionHandleString({
 						mode: CanvasConnectionMode.Input,
 						index: 0,
-						type: NodeConnectionType.Main,
+						type: NodeConnectionTypes.Main,
 					}),
 					data: {
-						source: { type: NodeConnectionType.Main, index: 0 },
-						target: { type: NodeConnectionType.Main, index: 0 },
+						source: { type: NodeConnectionTypes.Main, index: 0 },
+						target: { type: NodeConnectionTypes.Main, index: 0 },
 					},
 				},
 				{
@@ -1115,17 +1224,17 @@ describe('useCanvasOperations', () => {
 					sourceHandle: createCanvasConnectionHandleString({
 						mode: CanvasConnectionMode.Output,
 						index: 0,
-						type: NodeConnectionType.Main,
+						type: NodeConnectionTypes.Main,
 					}),
 					target: nodes[2].id,
 					targetHandle: createCanvasConnectionHandleString({
 						mode: CanvasConnectionMode.Input,
 						index: 0,
-						type: NodeConnectionType.Main,
+						type: NodeConnectionTypes.Main,
 					}),
 					data: {
-						source: { type: NodeConnectionType.Main, index: 0 },
-						target: { type: NodeConnectionType.Main, index: 0 },
+						source: { type: NodeConnectionTypes.Main, index: 0 },
+						target: { type: NodeConnectionTypes.Main, index: 0 },
 					},
 				},
 			];
@@ -1148,12 +1257,12 @@ describe('useCanvasOperations', () => {
 					{
 						index: 0,
 						node: 'Node A',
-						type: NodeConnectionType.Main,
+						type: NodeConnectionTypes.Main,
 					},
 					{
 						index: 0,
 						node: 'Node B',
-						type: NodeConnectionType.Main,
+						type: NodeConnectionTypes.Main,
 					},
 				],
 			});
@@ -1218,8 +1327,8 @@ describe('useCanvasOperations', () => {
 
 			const nodeTypeDescription = mockNodeTypeDescription({
 				name: SET_NODE_TYPE,
-				inputs: [NodeConnectionType.Main],
-				outputs: [NodeConnectionType.Main],
+				inputs: [NodeConnectionTypes.Main],
+				outputs: [NodeConnectionTypes.Main],
 			});
 
 			const nodeA = createTestNode({
@@ -1236,9 +1345,9 @@ describe('useCanvasOperations', () => {
 
 			const connection: Connection = {
 				source: nodeA.id,
-				sourceHandle: `outputs/${NodeConnectionType.Main}/0`,
+				sourceHandle: `outputs/${NodeConnectionTypes.Main}/0`,
 				target: nodeB.id,
-				targetHandle: `inputs/${NodeConnectionType.Main}/0`,
+				targetHandle: `inputs/${NodeConnectionTypes.Main}/0`,
 			};
 
 			nodeTypesStore.nodeTypes = {
@@ -1261,8 +1370,8 @@ describe('useCanvasOperations', () => {
 
 			expect(workflowsStore.addConnection).toHaveBeenCalledWith({
 				connection: [
-					{ index: 0, node: nodeA.name, type: NodeConnectionType.Main },
-					{ index: 0, node: nodeB.name, type: NodeConnectionType.Main },
+					{ index: 0, node: nodeA.name, type: NodeConnectionTypes.Main },
+					{ index: 0, node: nodeB.name, type: NodeConnectionTypes.Main },
 				],
 			});
 			expect(uiStore.stateIsDirty).toBe(true);
@@ -1275,8 +1384,8 @@ describe('useCanvasOperations', () => {
 
 			const nodeTypeDescription = mockNodeTypeDescription({
 				name: SET_NODE_TYPE,
-				inputs: [NodeConnectionType.Main],
-				outputs: [NodeConnectionType.Main],
+				inputs: [NodeConnectionTypes.Main],
+				outputs: [NodeConnectionTypes.Main],
 			});
 
 			const nodeA = createTestNode({
@@ -1293,9 +1402,9 @@ describe('useCanvasOperations', () => {
 
 			const connection: Connection = {
 				source: nodeA.id,
-				sourceHandle: `outputs/${NodeConnectionType.Main}/0`,
+				sourceHandle: `outputs/${NodeConnectionTypes.Main}/0`,
 				target: nodeB.id,
-				targetHandle: `inputs/${NodeConnectionType.Main}/0`,
+				targetHandle: `inputs/${NodeConnectionTypes.Main}/0`,
 			};
 
 			nodeTypesStore.nodeTypes = {
@@ -1324,8 +1433,8 @@ describe('useCanvasOperations', () => {
 		it('deletes connection if both source and target nodes exist', () => {
 			const workflowsStore = mockedStore(useWorkflowsStore);
 			const connection: [IConnection, IConnection] = [
-				{ node: 'sourceNode', type: NodeConnectionType.Main, index: 0 },
-				{ node: 'targetNode', type: NodeConnectionType.Main, index: 0 },
+				{ node: 'sourceNode', type: NodeConnectionTypes.Main, index: 0 },
+				{ node: 'targetNode', type: NodeConnectionTypes.Main, index: 0 },
 			];
 			const testNode = createTestNode();
 
@@ -1354,7 +1463,7 @@ describe('useCanvasOperations', () => {
 			});
 			const sourceHandle: IConnection = {
 				node: sourceNode.name,
-				type: NodeConnectionType.Main,
+				type: NodeConnectionTypes.Main,
 				index: 0,
 			};
 			const targetNode = mockNode({
@@ -1368,7 +1477,7 @@ describe('useCanvasOperations', () => {
 			});
 			const targetHandle: IConnection = {
 				node: targetNode.name,
-				type: NodeConnectionType.Main,
+				type: NodeConnectionTypes.Main,
 				index: 0,
 			};
 
@@ -1402,7 +1511,7 @@ describe('useCanvasOperations', () => {
 			});
 			const sourceHandle: IConnection = {
 				node: sourceNode.name,
-				type: NodeConnectionType.Main,
+				type: NodeConnectionTypes.Main,
 				index: 0,
 			};
 			const targetNode = mockNode({
@@ -1412,11 +1521,11 @@ describe('useCanvasOperations', () => {
 			});
 			const targetNodeTypeDescription = mockNodeTypeDescription({
 				name: targetNode.type,
-				inputs: [NodeConnectionType.Main],
+				inputs: [NodeConnectionTypes.Main],
 			});
 			const targetHandle: IConnection = {
 				node: targetNode.name,
-				type: NodeConnectionType.Main,
+				type: NodeConnectionTypes.Main,
 				index: 0,
 			};
 
@@ -1444,11 +1553,11 @@ describe('useCanvasOperations', () => {
 			});
 			const sourceNodeTypeDescription = mockNodeTypeDescription({
 				name: sourceNode.type,
-				outputs: [NodeConnectionType.Main],
+				outputs: [NodeConnectionTypes.Main],
 			});
 			const sourceHandle: IConnection = {
 				node: sourceNode.name,
-				type: NodeConnectionType.AiTool,
+				type: NodeConnectionTypes.AiTool,
 				index: 0,
 			};
 
@@ -1459,11 +1568,11 @@ describe('useCanvasOperations', () => {
 			});
 			const targetNodeTypeDescription = mockNodeTypeDescription({
 				name: 'targetType',
-				inputs: [NodeConnectionType.AiTool],
+				inputs: [NodeConnectionTypes.AiTool],
 			});
 			const targetHandle: IConnection = {
 				node: targetNode.name,
-				type: NodeConnectionType.AiTool,
+				type: NodeConnectionTypes.AiTool,
 				index: 0,
 			};
 
@@ -1495,11 +1604,11 @@ describe('useCanvasOperations', () => {
 			});
 			const sourceNodeTypeDescription = mockNodeTypeDescription({
 				name: sourceNode.type,
-				outputs: [NodeConnectionType.Main],
+				outputs: [NodeConnectionTypes.Main],
 			});
 			const sourceHandle: IConnection = {
 				node: sourceNode.name,
-				type: NodeConnectionType.Main,
+				type: NodeConnectionTypes.Main,
 				index: 0,
 			};
 
@@ -1510,11 +1619,11 @@ describe('useCanvasOperations', () => {
 			});
 			const targetNodeTypeDescription = mockNodeTypeDescription({
 				name: 'targetType',
-				inputs: [NodeConnectionType.AiTool],
+				inputs: [NodeConnectionTypes.AiTool],
 			});
 			const targetHandle: IConnection = {
 				node: targetNode.name,
-				type: NodeConnectionType.AiTool,
+				type: NodeConnectionTypes.AiTool,
 				index: 0,
 			};
 
@@ -1547,11 +1656,11 @@ describe('useCanvasOperations', () => {
 			});
 			const sourceNodeTypeDescription = mockNodeTypeDescription({
 				name: sourceNode.type,
-				outputs: [NodeConnectionType.Main],
+				outputs: [NodeConnectionTypes.Main],
 			});
 			const sourceHandle: IConnection = {
 				node: sourceNode.name,
-				type: NodeConnectionType.Main,
+				type: NodeConnectionTypes.Main,
 				index: 0,
 			};
 
@@ -1565,7 +1674,7 @@ describe('useCanvasOperations', () => {
 				name: 'targetType',
 				inputs: [
 					{
-						type: NodeConnectionType.Main,
+						type: NodeConnectionTypes.Main,
 						filter: {
 							nodes: ['allowedType'],
 						},
@@ -1574,7 +1683,7 @@ describe('useCanvasOperations', () => {
 			});
 			const targetHandle: IConnection = {
 				node: targetNode.name,
-				type: NodeConnectionType.Main,
+				type: NodeConnectionTypes.Main,
 				index: 0,
 			};
 
@@ -1607,11 +1716,11 @@ describe('useCanvasOperations', () => {
 			});
 			const sourceNodeTypeDescription = mockNodeTypeDescription({
 				name: sourceNode.type,
-				outputs: [NodeConnectionType.Main],
+				outputs: [NodeConnectionTypes.Main],
 			});
 			const sourceHandle: IConnection = {
 				node: sourceNode.name,
-				type: NodeConnectionType.Main,
+				type: NodeConnectionTypes.Main,
 				index: 1,
 			};
 
@@ -1625,7 +1734,7 @@ describe('useCanvasOperations', () => {
 				name: targetNode.type,
 				inputs: [
 					{
-						type: NodeConnectionType.Main,
+						type: NodeConnectionTypes.Main,
 						filter: {
 							nodes: [sourceNode.type],
 						},
@@ -1634,7 +1743,7 @@ describe('useCanvasOperations', () => {
 			});
 			const targetHandle: IConnection = {
 				node: targetNode.name,
-				type: NodeConnectionType.Main,
+				type: NodeConnectionTypes.Main,
 				index: 0,
 			};
 
@@ -1667,11 +1776,11 @@ describe('useCanvasOperations', () => {
 			});
 			const sourceNodeTypeDescription = mockNodeTypeDescription({
 				name: sourceNode.type,
-				outputs: [NodeConnectionType.Main],
+				outputs: [NodeConnectionTypes.Main],
 			});
 			const sourceHandle: IConnection = {
 				node: sourceNode.name,
-				type: NodeConnectionType.Main,
+				type: NodeConnectionTypes.Main,
 				index: 0,
 			};
 
@@ -1685,7 +1794,7 @@ describe('useCanvasOperations', () => {
 				name: targetNode.type,
 				inputs: [
 					{
-						type: NodeConnectionType.Main,
+						type: NodeConnectionTypes.Main,
 						filter: {
 							nodes: [sourceNode.type],
 						},
@@ -1694,7 +1803,7 @@ describe('useCanvasOperations', () => {
 			});
 			const targetHandle: IConnection = {
 				node: targetNode.name,
-				type: NodeConnectionType.Main,
+				type: NodeConnectionTypes.Main,
 				index: 1,
 			};
 
@@ -1728,11 +1837,11 @@ describe('useCanvasOperations', () => {
 			});
 			const sourceNodeTypeDescription = mockNodeTypeDescription({
 				name: sourceNode.type,
-				outputs: [NodeConnectionType.Main],
+				outputs: [NodeConnectionTypes.Main],
 			});
 			const sourceHandle: IConnection = {
 				node: sourceNode.name,
-				type: NodeConnectionType.Main,
+				type: NodeConnectionTypes.Main,
 				index: 0,
 			};
 
@@ -1746,7 +1855,7 @@ describe('useCanvasOperations', () => {
 				name: targetNode.type,
 				inputs: [
 					{
-						type: NodeConnectionType.Main,
+						type: NodeConnectionTypes.Main,
 						filter: {
 							nodes: [sourceNode.type],
 						},
@@ -1755,7 +1864,7 @@ describe('useCanvasOperations', () => {
 			});
 			const targetHandle: IConnection = {
 				node: targetNode.name,
-				type: NodeConnectionType.Main,
+				type: NodeConnectionTypes.Main,
 				index: 0,
 			};
 
@@ -1789,11 +1898,11 @@ describe('useCanvasOperations', () => {
 			});
 			const sourceNodeTypeDescription = mockNodeTypeDescription({
 				name: sourceNode.type,
-				outputs: [NodeConnectionType.Main],
+				outputs: [NodeConnectionTypes.Main],
 			});
 			const sourceHandle: IConnection = {
 				node: sourceNode.name,
-				type: NodeConnectionType.Main,
+				type: NodeConnectionTypes.Main,
 				index: 0,
 			};
 
@@ -1807,13 +1916,13 @@ describe('useCanvasOperations', () => {
 				name: targetNode.type,
 				inputs: [
 					{
-						type: NodeConnectionType.Main,
+						type: NodeConnectionTypes.Main,
 					},
 				],
 			});
 			const targetHandle: IConnection = {
 				node: targetNode.name,
-				type: NodeConnectionType.Main,
+				type: NodeConnectionTypes.Main,
 				index: 0,
 			};
 
@@ -1847,16 +1956,16 @@ describe('useCanvasOperations', () => {
 			});
 			const sourceNodeTypeDescription = mockNodeTypeDescription({
 				name: sourceNode.type,
-				outputs: [NodeConnectionType.Main],
+				outputs: [NodeConnectionTypes.Main],
 			});
 			const sourceHandle: IConnection = {
 				node: sourceNode.name,
-				type: NodeConnectionType.Main,
+				type: NodeConnectionTypes.Main,
 				index: 0,
 			};
 			const targetHandle: IConnection = {
 				node: sourceNode.name,
-				type: NodeConnectionType.Main,
+				type: NodeConnectionTypes.Main,
 				index: 0,
 			};
 
@@ -1923,9 +2032,9 @@ describe('useCanvasOperations', () => {
 
 			const connection: Connection = {
 				source: nodeA.id,
-				sourceHandle: `outputs/${NodeConnectionType.Main}/0`,
+				sourceHandle: `outputs/${NodeConnectionTypes.Main}/0`,
 				target: nodeB.id,
-				targetHandle: `inputs/${NodeConnectionType.Main}/0`,
+				targetHandle: `inputs/${NodeConnectionTypes.Main}/0`,
 			};
 
 			workflowsStore.getNodeById.mockReturnValueOnce(nodeA).mockReturnValueOnce(nodeB);
@@ -1935,8 +2044,8 @@ describe('useCanvasOperations', () => {
 
 			expect(workflowsStore.removeConnection).toHaveBeenCalledWith({
 				connection: [
-					{ index: 0, node: nodeA.name, type: NodeConnectionType.Main },
-					{ index: 0, node: nodeB.name, type: NodeConnectionType.Main },
+					{ index: 0, node: nodeA.name, type: NodeConnectionTypes.Main },
+					{ index: 0, node: nodeB.name, type: NodeConnectionTypes.Main },
 				],
 			});
 		});
@@ -1947,8 +2056,8 @@ describe('useCanvasOperations', () => {
 			const workflowsStore = mockedStore(useWorkflowsStore);
 
 			const connection: [IConnection, IConnection] = [
-				{ node: 'sourceNode', type: NodeConnectionType.Main, index: 1 },
-				{ node: 'targetNode', type: NodeConnectionType.Main, index: 2 },
+				{ node: 'sourceNode', type: NodeConnectionTypes.Main, index: 1 },
+				{ node: 'targetNode', type: NodeConnectionTypes.Main, index: 2 },
 			];
 
 			const { revertDeleteConnection } = useCanvasOperations({ router });
@@ -1999,7 +2108,7 @@ describe('useCanvasOperations', () => {
 			});
 			const targetNodeType = mockNodeTypeDescription({
 				name: SET_NODE_TYPE,
-				inputs: [NodeConnectionType.Main],
+				inputs: [NodeConnectionTypes.Main],
 			});
 
 			const sourceNodeId = 'source';
@@ -2010,14 +2119,14 @@ describe('useCanvasOperations', () => {
 			});
 			const sourceNodeType = mockNodeTypeDescription({
 				name: AGENT_NODE_TYPE,
-				outputs: [NodeConnectionType.AiTool],
+				outputs: [NodeConnectionTypes.AiTool],
 			});
 
 			workflowsStore.workflow.nodes = [sourceNode, targetNode];
 			workflowsStore.workflow.connections = {
 				[sourceNode.name]: {
-					[NodeConnectionType.AiTool]: [
-						[{ node: targetNode.name, type: NodeConnectionType.Main, index: 0 }],
+					[NodeConnectionTypes.AiTool]: [
+						[{ node: targetNode.name, type: NodeConnectionTypes.Main, index: 0 }],
 					],
 				},
 			};
@@ -2043,8 +2152,8 @@ describe('useCanvasOperations', () => {
 
 			expect(workflowsStore.removeConnection).toHaveBeenCalledWith({
 				connection: [
-					{ node: sourceNode.name, type: NodeConnectionType.AiTool, index: 0 },
-					{ node: targetNode.name, type: NodeConnectionType.Main, index: 0 },
+					{ node: sourceNode.name, type: NodeConnectionTypes.AiTool, index: 0 },
+					{ node: targetNode.name, type: NodeConnectionTypes.Main, index: 0 },
 				],
 			});
 		});
@@ -2063,7 +2172,7 @@ describe('useCanvasOperations', () => {
 			});
 			const targetNodeType = mockNodeTypeDescription({
 				name: SET_NODE_TYPE,
-				inputs: [NodeConnectionType.Main],
+				inputs: [NodeConnectionTypes.Main],
 			});
 
 			const sourceNodeId = 'source';
@@ -2074,14 +2183,14 @@ describe('useCanvasOperations', () => {
 			});
 			const sourceNodeType = mockNodeTypeDescription({
 				name: AGENT_NODE_TYPE,
-				outputs: [NodeConnectionType.Main],
+				outputs: [NodeConnectionTypes.Main],
 			});
 
 			workflowsStore.workflow.nodes = [sourceNode, targetNode];
 			workflowsStore.workflow.connections = {
 				[sourceNode.name]: {
-					[NodeConnectionType.Main]: [
-						[{ node: targetNode.name, type: NodeConnectionType.Main, index: 0 }],
+					[NodeConnectionTypes.Main]: [
+						[{ node: targetNode.name, type: NodeConnectionTypes.Main, index: 0 }],
 					],
 				},
 			};
@@ -2148,7 +2257,7 @@ describe('useCanvasOperations', () => {
 			});
 			const targetNodeType = mockNodeTypeDescription({
 				name: SET_NODE_TYPE,
-				inputs: [NodeConnectionType.Main],
+				inputs: [NodeConnectionTypes.Main],
 			});
 
 			const sourceNodeId = 'source';
@@ -2159,14 +2268,14 @@ describe('useCanvasOperations', () => {
 			});
 			const sourceNodeType = mockNodeTypeDescription({
 				name: AGENT_NODE_TYPE,
-				outputs: [NodeConnectionType.AiTool],
+				outputs: [NodeConnectionTypes.AiTool],
 			});
 
 			workflowsStore.workflow.nodes = [sourceNode, targetNode];
 			workflowsStore.workflow.connections = {
 				[sourceNode.name]: {
-					[NodeConnectionType.AiTool]: [
-						[{ node: targetNode.name, type: NodeConnectionType.Main, index: 0 }],
+					[NodeConnectionTypes.AiTool]: [
+						[{ node: targetNode.name, type: NodeConnectionTypes.Main, index: 0 }],
 					],
 				},
 			};
@@ -2192,8 +2301,8 @@ describe('useCanvasOperations', () => {
 
 			expect(workflowsStore.removeConnection).toHaveBeenCalledWith({
 				connection: [
-					{ node: sourceNode.name, type: NodeConnectionType.AiTool, index: 0 },
-					{ node: targetNode.name, type: NodeConnectionType.Main, index: 0 },
+					{ node: sourceNode.name, type: NodeConnectionTypes.AiTool, index: 0 },
+					{ node: targetNode.name, type: NodeConnectionTypes.Main, index: 0 },
 				],
 			});
 		});
@@ -2212,7 +2321,7 @@ describe('useCanvasOperations', () => {
 			});
 			const targetNodeType = mockNodeTypeDescription({
 				name: SET_NODE_TYPE,
-				inputs: [NodeConnectionType.Main],
+				inputs: [NodeConnectionTypes.Main],
 			});
 
 			const sourceNodeId = 'source';
@@ -2223,14 +2332,14 @@ describe('useCanvasOperations', () => {
 			});
 			const sourceNodeType = mockNodeTypeDescription({
 				name: AGENT_NODE_TYPE,
-				outputs: [NodeConnectionType.Main],
+				outputs: [NodeConnectionTypes.Main],
 			});
 
 			workflowsStore.workflow.nodes = [sourceNode, targetNode];
 			workflowsStore.workflow.connections = {
 				[sourceNode.name]: {
-					[NodeConnectionType.AiTool]: [
-						[{ node: targetNode.name, type: NodeConnectionType.Main, index: 0 }],
+					[NodeConnectionTypes.AiTool]: [
+						[{ node: targetNode.name, type: NodeConnectionTypes.Main, index: 0 }],
 					],
 				},
 			};
@@ -2266,13 +2375,13 @@ describe('useCanvasOperations', () => {
 
 			workflowsStore.workflow.connections = {
 				[node1.name]: {
-					[NodeConnectionType.Main]: [
-						[{ node: node2.name, type: NodeConnectionType.Main, index: 0 }],
+					[NodeConnectionTypes.Main]: [
+						[{ node: node2.name, type: NodeConnectionTypes.Main, index: 0 }],
 					],
 				},
 				node2: {
-					[NodeConnectionType.Main]: [
-						[{ node: node1.name, type: NodeConnectionType.Main, index: 0 }],
+					[NodeConnectionTypes.Main]: [
+						[{ node: node1.name, type: NodeConnectionTypes.Main, index: 0 }],
 					],
 				},
 			};
@@ -2284,15 +2393,15 @@ describe('useCanvasOperations', () => {
 
 			expect(workflowsStore.removeConnection).toHaveBeenCalledWith({
 				connection: [
-					{ node: node1.name, type: NodeConnectionType.Main, index: 0 },
-					{ node: node2.name, type: NodeConnectionType.Main, index: 0 },
+					{ node: node1.name, type: NodeConnectionTypes.Main, index: 0 },
+					{ node: node2.name, type: NodeConnectionTypes.Main, index: 0 },
 				],
 			});
 
 			expect(workflowsStore.removeConnection).toHaveBeenCalledWith({
 				connection: [
-					{ node: node2.name, type: NodeConnectionType.Main, index: 0 },
-					{ node: node1.name, type: NodeConnectionType.Main, index: 0 },
+					{ node: node2.name, type: NodeConnectionTypes.Main, index: 0 },
+					{ node: node1.name, type: NodeConnectionTypes.Main, index: 0 },
 				],
 			});
 
@@ -2309,6 +2418,82 @@ describe('useCanvasOperations', () => {
 			deleteConnectionsByNodeId(nodeId);
 
 			expect(workflowsStore.removeConnection).not.toHaveBeenCalled();
+		});
+
+		it('should delete all connections of a node with multiple connections', () => {
+			const workflowsStore = mockedStore(useWorkflowsStore);
+			const { deleteConnectionsByNodeId } = useCanvasOperations({ router });
+
+			const sourceNode = createTestNode({ id: 'source', name: 'Source Node' });
+			const targetNode = createTestNode({ id: 'target', name: 'Target Node' });
+
+			workflowsStore.workflow.nodes = [sourceNode, targetNode];
+			workflowsStore.workflow.connections = {
+				[sourceNode.name]: {
+					[NodeConnectionTypes.Main]: [
+						[
+							{ node: targetNode.name, type: NodeConnectionTypes.Main, index: 0 },
+							{ node: targetNode.name, type: NodeConnectionTypes.Main, index: 1 },
+						],
+					],
+				},
+				[targetNode.name]: {
+					[NodeConnectionTypes.Main]: [],
+				},
+			};
+
+			workflowsStore.getNodeById = vi.fn().mockImplementation((id) => {
+				if (id === sourceNode.id) return sourceNode;
+				if (id === targetNode.id) return targetNode;
+				return null;
+			});
+			workflowsStore.getNodeByName = vi.fn().mockImplementation((name) => {
+				if (name === sourceNode.name) return sourceNode;
+				if (name === targetNode.name) return targetNode;
+				return null;
+			});
+
+			workflowsStore.removeConnection = vi
+				.fn()
+				.mockImplementation((data: { connection: IConnection[] }) => {
+					const sourceData = data.connection[0];
+					const destinationData = data.connection[1];
+
+					const connections =
+						workflowsStore.workflow.connections[sourceData.node][sourceData.type][sourceData.index];
+
+					for (const index in connections) {
+						if (
+							connections[+index].node === destinationData.node &&
+							connections[+index].type === destinationData.type &&
+							connections[+index].index === destinationData.index
+						) {
+							connections.splice(parseInt(index, 10), 1);
+						}
+					}
+				});
+
+			deleteConnectionsByNodeId(targetNode.id);
+
+			expect(workflowsStore.removeConnection).toHaveBeenCalledTimes(2);
+
+			expect(workflowsStore.removeConnection).toHaveBeenCalledWith({
+				connection: [
+					{ node: sourceNode.name, type: NodeConnectionTypes.Main, index: 0 },
+					{ node: targetNode.name, type: NodeConnectionTypes.Main, index: 0 },
+				],
+			});
+
+			expect(workflowsStore.removeConnection).toHaveBeenCalledWith({
+				connection: [
+					{ node: sourceNode.name, type: NodeConnectionTypes.Main, index: 0 },
+					{ node: targetNode.name, type: NodeConnectionTypes.Main, index: 1 },
+				],
+			});
+
+			expect(
+				workflowsStore.workflow.connections[sourceNode.name][NodeConnectionTypes.Main][0],
+			).toEqual([]);
 		});
 	});
 
@@ -2484,12 +2669,12 @@ describe('useCanvasOperations', () => {
 	describe('filterConnectionsByNodes', () => {
 		it('should return filtered connections when all nodes are included', () => {
 			const connections: INodeConnections = {
-				[NodeConnectionType.Main]: [
+				[NodeConnectionTypes.Main]: [
 					[
-						{ node: 'node1', type: NodeConnectionType.Main, index: 0 },
-						{ node: 'node2', type: NodeConnectionType.Main, index: 0 },
+						{ node: 'node1', type: NodeConnectionTypes.Main, index: 0 },
+						{ node: 'node2', type: NodeConnectionTypes.Main, index: 0 },
 					],
-					[{ node: 'node3', type: NodeConnectionType.Main, index: 0 }],
+					[{ node: 'node3', type: NodeConnectionTypes.Main, index: 0 }],
 				],
 			};
 			const includeNodeNames = new Set<string>(['node1', 'node2', 'node3']);
@@ -2502,12 +2687,12 @@ describe('useCanvasOperations', () => {
 
 		it('should return empty connections when no nodes are included', () => {
 			const connections: INodeConnections = {
-				[NodeConnectionType.Main]: [
+				[NodeConnectionTypes.Main]: [
 					[
-						{ node: 'node1', type: NodeConnectionType.Main, index: 0 },
-						{ node: 'node2', type: NodeConnectionType.Main, index: 0 },
+						{ node: 'node1', type: NodeConnectionTypes.Main, index: 0 },
+						{ node: 'node2', type: NodeConnectionTypes.Main, index: 0 },
 					],
-					[{ node: 'node3', type: NodeConnectionType.Main, index: 0 }],
+					[{ node: 'node3', type: NodeConnectionTypes.Main, index: 0 }],
 				],
 			};
 			const includeNodeNames = new Set<string>();
@@ -2516,18 +2701,18 @@ describe('useCanvasOperations', () => {
 			const result = filterConnectionsByNodes(connections, includeNodeNames);
 
 			expect(result).toEqual({
-				[NodeConnectionType.Main]: [[], []],
+				[NodeConnectionTypes.Main]: [[], []],
 			});
 		});
 
 		it('should return partially filtered connections when some nodes are included', () => {
 			const connections: INodeConnections = {
-				[NodeConnectionType.Main]: [
+				[NodeConnectionTypes.Main]: [
 					[
-						{ node: 'node1', type: NodeConnectionType.Main, index: 0 },
-						{ node: 'node2', type: NodeConnectionType.Main, index: 0 },
+						{ node: 'node1', type: NodeConnectionTypes.Main, index: 0 },
+						{ node: 'node2', type: NodeConnectionTypes.Main, index: 0 },
 					],
-					[{ node: 'node3', type: NodeConnectionType.Main, index: 0 }],
+					[{ node: 'node3', type: NodeConnectionTypes.Main, index: 0 }],
 				],
 			};
 			const includeNodeNames = new Set<string>(['node1']);
@@ -2536,8 +2721,8 @@ describe('useCanvasOperations', () => {
 			const result = filterConnectionsByNodes(connections, includeNodeNames);
 
 			expect(result).toEqual({
-				[NodeConnectionType.Main]: [
-					[{ node: 'node1', type: NodeConnectionType.Main, index: 0 }],
+				[NodeConnectionTypes.Main]: [
+					[{ node: 'node1', type: NodeConnectionTypes.Main, index: 0 }],
 					[],
 				],
 			});
@@ -2555,12 +2740,12 @@ describe('useCanvasOperations', () => {
 
 		it('should handle connections with no valid nodes', () => {
 			const connections: INodeConnections = {
-				[NodeConnectionType.Main]: [
+				[NodeConnectionTypes.Main]: [
 					[
-						{ node: 'node4', type: NodeConnectionType.Main, index: 0 },
-						{ node: 'node5', type: NodeConnectionType.Main, index: 0 },
+						{ node: 'node4', type: NodeConnectionTypes.Main, index: 0 },
+						{ node: 'node5', type: NodeConnectionTypes.Main, index: 0 },
 					],
-					[{ node: 'node6', type: NodeConnectionType.Main, index: 0 }],
+					[{ node: 'node6', type: NodeConnectionTypes.Main, index: 0 }],
 				],
 			};
 			const includeNodeNames = new Set<string>(['node1', 'node2', 'node3']);
@@ -2569,7 +2754,7 @@ describe('useCanvasOperations', () => {
 			const result = filterConnectionsByNodes(connections, includeNodeNames);
 
 			expect(result).toEqual({
-				[NodeConnectionType.Main]: [[], []],
+				[NodeConnectionTypes.Main]: [[], []],
 			});
 		});
 	});
@@ -2633,6 +2818,39 @@ describe('useCanvasOperations', () => {
 
 			expect(workflowsStore.setWorkflowPinData).toHaveBeenCalledWith({});
 		});
+		it('should show an error notification for failed executions', async () => {
+			const workflowsStore = mockedStore(useWorkflowsStore);
+			const { openExecution } = useCanvasOperations({ router });
+			const toast = useToast();
+
+			const executionId = '123';
+			const executionData: IExecutionResponse = {
+				id: executionId,
+				finished: true,
+				status: 'error',
+				startedAt: new Date(),
+				createdAt: new Date(),
+				workflowData: createTestWorkflow(),
+				mode: 'manual',
+				data: {
+					resultData: {
+						error: { message: 'Crashed', node: { name: 'Step1' } },
+						lastNodeExecuted: 'Last Node',
+					},
+				} as IExecutionResponse['data'],
+			};
+
+			workflowsStore.getExecution.mockResolvedValue(executionData);
+
+			await openExecution(executionId);
+
+			expect(toast.showMessage).toHaveBeenCalledWith({
+				duration: 0,
+				message: 'Crashed',
+				title: 'Problem in node ‘Last Node‘',
+				type: 'error',
+			});
+		});
 	});
 
 	describe('connectAdjacentNodes', () => {
@@ -2648,8 +2866,8 @@ describe('useCanvasOperations', () => {
 
 			const nodeTypeDescription = mockNodeTypeDescription({
 				name: nodeA.type,
-				inputs: [NodeConnectionType.Main],
-				outputs: [NodeConnectionType.Main],
+				inputs: [NodeConnectionTypes.Main],
+				outputs: [NodeConnectionTypes.Main],
 			});
 
 			nodeTypesStore.getNodeType = vi.fn(() => nodeTypeDescription);
@@ -2658,10 +2876,10 @@ describe('useCanvasOperations', () => {
 			workflowsStore.workflow.nodes = [nodeA, nodeB, nodeC];
 			workflowsStore.workflow.connections = {
 				[nodeA.name]: {
-					main: [[{ node: nodeB.name, type: NodeConnectionType.Main, index: 0 }]],
+					main: [[{ node: nodeB.name, type: NodeConnectionTypes.Main, index: 0 }]],
 				},
 				[nodeB.name]: {
-					main: [[{ node: nodeC.name, type: NodeConnectionType.Main, index: 0 }]],
+					main: [[{ node: nodeC.name, type: NodeConnectionTypes.Main, index: 0 }]],
 				},
 			};
 
@@ -2685,10 +2903,10 @@ describe('useCanvasOperations', () => {
 					})[name],
 			);
 			workflowsStore.outgoingConnectionsByNodeName.mockReturnValue({
-				main: [[{ node: nodeC.name, type: NodeConnectionType.Main, index: 0 }]],
+				main: [[{ node: nodeC.name, type: NodeConnectionTypes.Main, index: 0 }]],
 			});
 			workflowsStore.incomingConnectionsByNodeName.mockReturnValue({
-				main: [[{ node: nodeA.name, type: NodeConnectionType.Main, index: 0 }]],
+				main: [[{ node: nodeA.name, type: NodeConnectionTypes.Main, index: 0 }]],
 			});
 
 			const { connectAdjacentNodes } = useCanvasOperations({ router });
@@ -2697,8 +2915,8 @@ describe('useCanvasOperations', () => {
 			// Check that A was connected directly to C
 			expect(workflowsStore.addConnection).toHaveBeenCalledWith({
 				connection: [
-					{ node: nodeA.name, type: NodeConnectionType.Main, index: 0 },
-					{ node: nodeC.name, type: NodeConnectionType.Main, index: 0 },
+					{ node: nodeA.name, type: NodeConnectionTypes.Main, index: 0 },
+					{ node: nodeC.name, type: NodeConnectionTypes.Main, index: 0 },
 				],
 			});
 
@@ -2718,8 +2936,8 @@ describe('useCanvasOperations', () => {
 
 			const nodeTypeDescription = mockNodeTypeDescription({
 				name: nodeA.type,
-				inputs: [NodeConnectionType.Main, NodeConnectionType.Main],
-				outputs: [NodeConnectionType.Main, NodeConnectionType.Main],
+				inputs: [NodeConnectionTypes.Main, NodeConnectionTypes.Main],
+				outputs: [NodeConnectionTypes.Main, NodeConnectionTypes.Main],
 			});
 
 			nodeTypesStore.getNodeType = vi.fn(() => nodeTypeDescription);
@@ -2728,10 +2946,10 @@ describe('useCanvasOperations', () => {
 			workflowsStore.workflow.nodes = [nodeA, nodeB, nodeC];
 			workflowsStore.workflow.connections = {
 				[nodeA.name]: {
-					main: [[{ node: nodeB.name, type: NodeConnectionType.Main, index: 1 }]],
+					main: [[{ node: nodeB.name, type: NodeConnectionTypes.Main, index: 1 }]],
 				},
 				[nodeB.name]: {
-					main: [[{ node: nodeC.name, type: NodeConnectionType.Main, index: 0 }]],
+					main: [[{ node: nodeC.name, type: NodeConnectionTypes.Main, index: 0 }]],
 				},
 			};
 
@@ -2755,10 +2973,10 @@ describe('useCanvasOperations', () => {
 					})[name],
 			);
 			workflowsStore.outgoingConnectionsByNodeName.mockReturnValue({
-				main: [[{ node: nodeC.name, type: NodeConnectionType.Main, index: 1 }]],
+				main: [[{ node: nodeC.name, type: NodeConnectionTypes.Main, index: 1 }]],
 			});
 			workflowsStore.incomingConnectionsByNodeName.mockReturnValue({
-				main: [[{ node: nodeA.name, type: NodeConnectionType.Main, index: 0 }]],
+				main: [[{ node: nodeA.name, type: NodeConnectionTypes.Main, index: 0 }]],
 			});
 
 			const { connectAdjacentNodes } = useCanvasOperations({ router });
@@ -2767,8 +2985,8 @@ describe('useCanvasOperations', () => {
 			// Check that A was connected directly to C
 			expect(workflowsStore.addConnection).toHaveBeenCalledWith({
 				connection: [
-					{ node: nodeA.name, type: NodeConnectionType.Main, index: 0 },
-					{ node: nodeC.name, type: NodeConnectionType.Main, index: 1 },
+					{ node: nodeA.name, type: NodeConnectionTypes.Main, index: 0 },
+					{ node: nodeC.name, type: NodeConnectionTypes.Main, index: 1 },
 				],
 			});
 
@@ -2786,7 +3004,7 @@ describe('useCanvasOperations', () => {
 			workflowsStore.workflow.nodes = [nodeB, nodeC];
 			workflowsStore.workflow.connections = {
 				[nodeB.name]: {
-					main: [[{ node: nodeC.name, type: NodeConnectionType.Main, index: 0 }]],
+					main: [[{ node: nodeC.name, type: NodeConnectionTypes.Main, index: 0 }]],
 				},
 			};
 
@@ -2794,7 +3012,7 @@ describe('useCanvasOperations', () => {
 			workflowsStore.getCurrentWorkflow.mockReturnValue(workflowObject);
 			workflowsStore.getNodeById.mockReturnValue(nodeB);
 			workflowsStore.outgoingConnectionsByNodeName.mockReturnValue({
-				main: [[{ node: nodeC.name, type: NodeConnectionType.Main, index: 0 }]],
+				main: [[{ node: nodeC.name, type: NodeConnectionTypes.Main, index: 0 }]],
 			});
 			workflowsStore.incomingConnectionsByNodeName.mockReturnValue({});
 
@@ -2814,7 +3032,7 @@ describe('useCanvasOperations', () => {
 			workflowsStore.workflow.nodes = [nodeA, nodeB];
 			workflowsStore.workflow.connections = {
 				[nodeA.name]: {
-					main: [[{ node: nodeB.name, type: NodeConnectionType.Main, index: 0 }]],
+					main: [[{ node: nodeB.name, type: NodeConnectionTypes.Main, index: 0 }]],
 				},
 			};
 
@@ -2823,39 +3041,13 @@ describe('useCanvasOperations', () => {
 			workflowsStore.getNodeById.mockReturnValue(nodeB);
 			workflowsStore.outgoingConnectionsByNodeName.mockReturnValue({});
 			workflowsStore.incomingConnectionsByNodeName.mockReturnValue({
-				main: [[{ node: nodeA.name, type: NodeConnectionType.Main, index: 0 }]],
+				main: [[{ node: nodeA.name, type: NodeConnectionTypes.Main, index: 0 }]],
 			});
 
 			const { connectAdjacentNodes } = useCanvasOperations({ router });
 			connectAdjacentNodes(nodeB.id);
 
 			expect(workflowsStore.addConnection).not.toHaveBeenCalled();
-		});
-	});
-
-	describe('toggleChatOpen', () => {
-		it('should invoke workflowsStore#setPanelOpen with 2nd argument `true` if the chat panel is closed', async () => {
-			const workflowsStore = mockedStore(useWorkflowsStore);
-			const { toggleChatOpen } = useCanvasOperations({ router });
-
-			workflowsStore.getCurrentWorkflow.mockReturnValue(createTestWorkflowObject());
-			workflowsStore.isChatPanelOpen = false;
-
-			await toggleChatOpen('main');
-
-			expect(workflowsStore.setPanelOpen).toHaveBeenCalledWith('chat', true);
-		});
-
-		it('should invoke workflowsStore#setPanelOpen with 2nd argument `false` if the chat panel is open', async () => {
-			const workflowsStore = mockedStore(useWorkflowsStore);
-			const { toggleChatOpen } = useCanvasOperations({ router });
-
-			workflowsStore.getCurrentWorkflow.mockReturnValue(createTestWorkflowObject());
-			workflowsStore.isChatPanelOpen = true;
-
-			await toggleChatOpen('main');
-
-			expect(workflowsStore.setPanelOpen).toHaveBeenCalledWith('chat', false);
 		});
 	});
 
@@ -2889,7 +3081,7 @@ describe('useCanvasOperations', () => {
 				nodes: [nodeA, nodeB],
 				connections: {
 					[nodeA.name]: {
-						main: [[{ node: nodeB.name, type: NodeConnectionType.Main, index: 0 }]],
+						main: [[{ node: nodeB.name, type: NodeConnectionTypes.Main, index: 0 }]],
 					},
 				},
 			};
@@ -2905,19 +3097,19 @@ describe('useCanvasOperations', () => {
 			});
 
 			expect(workflowsStore.setConnections).toHaveBeenCalledWith(workflow.connections);
-			expect(workflowsStore.addNode).toHaveBeenCalledWith({
+			expect(workflowsStore.addNode).toHaveBeenNthCalledWith(1, {
 				...nodeA,
 				credentials: {},
 				disabled: false,
 			});
 			expect(workflowsStore.setNodePristine).toHaveBeenCalledWith(nodeA.name, true);
-			expect(workflowsStore.addNode).toHaveBeenCalledWith({
+			expect(workflowsStore.addNode).toHaveBeenNthCalledWith(2, {
 				...nodeB,
 				credentials: {},
 				disabled: false,
 			});
 			expect(workflowsStore.setNodePristine).toHaveBeenCalledWith(nodeB.name, true);
-			expect(workflowsStore.getNewWorkflowData).toHaveBeenCalledWith(
+			expect(workflowsStore.getNewWorkflowDataAndMakeShareable).toHaveBeenCalledWith(
 				templateName,
 				projectsStore.currentProjectId,
 			);

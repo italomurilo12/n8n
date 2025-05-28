@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import type { ResourceLocatorRequestDto } from '@n8n/api-types';
+import type { ResourceLocatorRequestDto, ActionResultRequestDto } from '@n8n/api-types';
 import type { IResourceLocatorResultExpanded, IUpdateInformation } from '@/Interface';
 import DraggableTarget from '@/components/DraggableTarget.vue';
 import ExpressionParameterInput from '@/components/ExpressionParameterInput.vue';
@@ -10,7 +10,7 @@ import { useWorkflowHelpers } from '@/composables/useWorkflowHelpers';
 import { ndvEventBus } from '@/event-bus';
 import { useNDVStore } from '@/stores/ndv.store';
 import { useNodeTypesStore } from '@/stores/nodeTypes.store';
-import { useRootStore } from '@/stores/root.store';
+import { useRootStore } from '@n8n/stores/useRootStore';
 import { useUIStore } from '@/stores/ui.store';
 import { useWorkflowsStore } from '@/stores/workflows.store';
 import {
@@ -18,19 +18,19 @@ import {
 	getMainAuthField,
 	hasOnlyListMode as hasOnlyListModeUtil,
 } from '@/utils/nodeTypesUtils';
-import { isResourceLocatorValue } from '@/utils/typeGuards';
 import stringify from 'fast-json-stable-stringify';
 import type { EventBus } from '@n8n/utils/event-bus';
 import { createEventBus } from '@n8n/utils/event-bus';
-import type {
-	INode,
-	INodeListSearchItems,
-	INodeParameterResourceLocator,
-	INodeParameters,
-	INodeProperties,
-	INodePropertyMode,
-	INodePropertyModeTypeOptions,
-	NodeParameterValue,
+import {
+	isResourceLocatorValue,
+	type INode,
+	type INodeListSearchItems,
+	type INodeParameterResourceLocator,
+	type INodeParameters,
+	type INodeProperties,
+	type INodePropertyMode,
+	type INodePropertyModeTypeOptions,
+	type NodeParameterValue,
 } from 'n8n-workflow';
 import {
 	computed,
@@ -53,11 +53,34 @@ import {
 	updateFromAIOverrideValues,
 	type FromAIOverride,
 } from '../../utils/fromAIOverrideUtils';
+import { N8nNotice } from '@n8n/design-system';
+import { completeExpressionSyntax } from '@/utils/expressions';
+import type { BaseTextKey } from '@/plugins/i18n';
+
+/**
+ * Regular expression to check if the error message contains credential-related phrases.
+ */
+const CHECK_CREDENTIALS_REGEX = /check\s+(your\s+)?credentials?/i;
+/**
+ * Error codes and messages that indicate a permission error.
+ */
+const PERMISSION_ERROR_CODES = ['401', '403'];
+const NODE_API_AUTH_ERROR_MESSAGES = [
+	'NodeApiError: Authorization failed',
+	'NodeApiError: Unable to sign without access token',
+	'secretOrPrivateKey must be an asymmetric key when using RS256',
+];
 
 interface IResourceLocatorQuery {
 	results: INodeListSearchItems[];
 	nextPageToken: unknown;
 	error: boolean;
+	errorDetails?: {
+		message?: string;
+		description?: string;
+		httpCode?: string;
+		stackTrace?: string;
+	};
 	loading: boolean;
 }
 
@@ -148,12 +171,21 @@ const selectedMode = computed(() => {
 
 const isListMode = computed(() => selectedMode.value === 'list');
 
-const hasCredential = computed(() => {
-	const node = ndvStore.activeNode;
-	if (!node) {
-		return false;
-	}
-	return !!(node?.credentials && Object.keys(node.credentials).length === 1);
+/**
+ * Check if the current response contains an error that indicates a credential issue.
+ * We do this by checking error http code
+ * But, since out NodeApiErrors sometimes just return 500, we also check the message and stack trace
+ */
+const hasCredentialError = computed(() => {
+	const stackTraceContainsCredentialError = (currentResponse.value?.errorDetails?.stackTrace ?? '')
+		.split('\n')
+		.some((line) => NODE_API_AUTH_ERROR_MESSAGES.includes(line.trim()));
+
+	return (
+		PERMISSION_ERROR_CODES.includes(currentResponse.value?.errorDetails?.httpCode ?? '') ||
+		NODE_API_AUTH_ERROR_MESSAGES.includes(currentResponse.value?.errorDetails?.message ?? '') ||
+		stackTraceContainsCredentialError
+	);
 });
 
 const credentialsNotSet = computed(() => {
@@ -315,6 +347,70 @@ const showOverrideButton = computed(
 	() => canBeContentOverride.value && !isContentOverride.value && !props.isReadOnly,
 );
 
+const allowNewResources = computed(() => {
+	if (!props.node) {
+		return undefined;
+	}
+
+	const addNewResourceOptions = getPropertyArgument(currentMode.value, 'allowNewResource');
+
+	if (!addNewResourceOptions || typeof addNewResourceOptions !== 'object') {
+		return undefined;
+	}
+
+	return {
+		label: i18n.baseText(addNewResourceOptions.label as BaseTextKey, {
+			interpolate: {
+				resourceName: !!searchFilter.value ? searchFilter.value : addNewResourceOptions.defaultName,
+			},
+		}),
+		method: addNewResourceOptions.method,
+	};
+});
+
+const handleAddResourceClick = async () => {
+	if (!props.node || !allowNewResources.value) {
+		return;
+	}
+
+	const { method: addNewResourceMethodName } = allowNewResources.value;
+	const resolvedNodeParameters = workflowHelpers.resolveRequiredParameters(
+		props.parameter,
+		currentRequestParams.value.parameters,
+	);
+
+	if (!resolvedNodeParameters || !addNewResourceMethodName) {
+		return;
+	}
+
+	const requestParams: ActionResultRequestDto = {
+		nodeTypeAndVersion: {
+			name: props.node.type,
+			version: props.node.typeVersion,
+		},
+		path: props.path,
+		currentNodeParameters: resolvedNodeParameters,
+		credentials: props.node.credentials,
+		handler: addNewResourceMethodName,
+		payload: {
+			name: searchFilter.value,
+		},
+	};
+
+	const newResource = (await nodeTypesStore.getNodeParameterActionResult(
+		requestParams,
+	)) as NodeParameterValue;
+
+	refreshList();
+	await loadResources();
+	searchFilter.value = '';
+	onListItemSelected(newResource);
+};
+
+const onAddResourceClicked = computed(() =>
+	allowNewResources.value ? handleAddResourceClick : undefined,
+);
+
 watch(currentQueryError, (curr, prev) => {
 	if (resourceDropdownVisible.value && curr && !prev) {
 		if (inputRef.value) {
@@ -325,10 +421,12 @@ watch(currentQueryError, (curr, prev) => {
 
 watch(
 	() => props.isValueExpression,
-	(newValue) => {
+	async (newValue) => {
 		if (newValue) {
 			switchFromListMode();
 		}
+		await nextTick();
+		inputRef.value?.focus();
 	},
 );
 
@@ -420,7 +518,7 @@ function openResource(url: string) {
 function getPropertyArgument(
 	parameter: INodePropertyMode,
 	argumentName: keyof INodePropertyModeTypeOptions,
-): string | number | boolean | undefined {
+): string | number | boolean | INodePropertyModeTypeOptions['allowNewResource'] | undefined {
 	return parameter.typeOptions?.[argumentName];
 }
 
@@ -486,6 +584,8 @@ function onInputChange(value: NodeParameterValue): void {
 		if (resource?.url) {
 			params.cachedResultUrl = resource.url;
 		}
+	} else {
+		params.value = completeExpressionSyntax(value);
 	}
 	emit('update:modelValue', params);
 }
@@ -643,8 +743,39 @@ async function loadResources() {
 		setResponse(paramsKey, {
 			loading: false,
 			error: true,
+			errorDetails: {
+				message: removeDuplicateTextFromErrorMessage(e.message),
+				description: e.description,
+				httpCode: e.httpCode,
+				stackTrace: e.stacktrace,
+			},
 		});
 	}
+}
+
+/**
+ * Removes duplicate credential-related sentences from error messages.
+ * We are already showing a link to create/check the credentials, so we don't need to repeat the same message.
+ */
+function removeDuplicateTextFromErrorMessage(message: string): string {
+	let segments: string[] = [];
+
+	// Split message into sentences or segments
+	if (/[-–—]/.test(message)) {
+		// By various dash types
+		segments = message.split(/\s*[-–—]\s*/);
+	} else {
+		// By sentence boundaries
+		segments = message.split(/(?<=[.!?])\s+/);
+	}
+
+	// Filter out segments containing credential check phrases
+	const filteredSegments = segments.filter((segment: string) => {
+		if (!segment.trim()) return false;
+		return !CHECK_CREDENTIALS_REGEX.test(segment);
+	});
+
+	return filteredSegments.join(' ').trim();
 }
 
 function onInputFocus(): void {
@@ -772,24 +903,51 @@ function removeOverride() {
 			:error-view="currentQueryError"
 			:width="width"
 			:event-bus="eventBus"
+			:allow-new-resources="allowNewResources"
 			@update:model-value="onListItemSelected"
 			@filter="onSearchFilter"
 			@load-more="loadResourcesDebounced"
+			@add-resource-click="onAddResourceClicked"
 		>
 			<template #error>
-				<div :class="$style.error" data-test-id="rlc-error-container">
-					<n8n-text color="text-dark" align="center" tag="div">
+				<div :class="$style.errorContainer" data-test-id="rlc-error-container">
+					<n8n-text
+						v-if="credentialsNotSet || currentResponse.errorDetails"
+						color="text-dark"
+						align="center"
+						tag="div"
+					>
 						{{ i18n.baseText('resourceLocator.mode.list.error.title') }}
 					</n8n-text>
-					<n8n-text v-if="hasCredential || credentialsNotSet" size="small" color="text-base">
-						{{ i18n.baseText('resourceLocator.mode.list.error.description.part1') }}
-						<a v-if="credentialsNotSet" @click="createNewCredential">{{
-							i18n.baseText('resourceLocator.mode.list.error.description.part2.noCredentials')
-						}}</a>
-						<a v-else-if="hasCredential" @click="openCredential">{{
-							i18n.baseText('resourceLocator.mode.list.error.description.part2.hasCredentials')
-						}}</a>
-					</n8n-text>
+					<div v-if="currentResponse.errorDetails" :class="$style.errorDetails">
+						<n8n-text size="small">
+							<span v-if="currentResponse.errorDetails.httpCode" data-test-id="rlc-error-code">
+								{{ currentResponse.errorDetails.httpCode }} -
+							</span>
+							<span data-test-id="rlc-error-message">{{
+								currentResponse.errorDetails.message
+							}}</span>
+						</n8n-text>
+						<N8nNotice
+							v-if="currentResponse.errorDetails.description"
+							theme="warning"
+							:class="$style.errorDescription"
+						>
+							{{ currentResponse.errorDetails.description }}
+						</N8nNotice>
+					</div>
+					<div v-if="hasCredentialError || credentialsNotSet" data-test-id="permission-error-link">
+						<a
+							v-if="credentialsNotSet"
+							:class="$style['credential-link']"
+							@click="createNewCredential"
+						>
+							{{ i18n.baseText('resourceLocator.mode.list.error.description.noCredentials') }}
+						</a>
+						<a v-else :class="$style['credential-link']" @click="openCredential">
+							{{ i18n.baseText('resourceLocator.mode.list.error.description.checkCredentials') }}
+						</a>
+					</div>
 				</div>
 			</template>
 			<div
@@ -820,6 +978,7 @@ function removeOverride() {
 						<n8n-option
 							v-for="mode in parameter.modes"
 							:key="mode.name"
+							:data-test-id="`mode-${mode.name}`"
 							:value="mode.name"
 							:label="getModeLabel(mode)"
 							:disabled="isValueExpression && mode.name === 'list'"
